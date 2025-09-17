@@ -1,18 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	"revshell/pkg/secureio"
+	"revshell/pkg/terminal"
 )
 
 func main() {
@@ -40,37 +39,18 @@ func main() {
 
 	log.Printf("client: connected to %s using %s cipher", *addr, *cipherName)
 
-	doneReading := make(chan error, 1)
-	doneWriting := make(chan error, 1)
-
-	go func() {
-		_, err := io.Copy(os.Stdout, reader)
-		doneReading <- err
-	}()
-
-	go func() {
-		_, err := io.Copy(writer, os.Stdin)
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			_ = tcpConn.CloseWrite()
-		}
-		doneWriting <- err
-	}()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	var readErr error
-	select {
-	case readErr = <-doneReading:
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			log.Printf("client: read error: %v", readErr)
-		}
-	case sig := <-sigCh:
-		log.Printf("client: received signal %s, shutting down", sig)
+	bufferedReader := bufio.NewReader(reader)
+	sessionOpts, err := terminal.ReceiveOptions(bufferedReader)
+	if err != nil {
+		log.Fatalf("client: failed to receive session options: %v", err)
 	}
 
-	_ = conn.Close()
-	if writeErr := <-doneWriting; writeErr != nil && !errors.Is(writeErr, os.ErrClosed) {
-		log.Printf("client: write error: %v", writeErr)
+	session, err := terminal.NewSession(bufferedReader, writer, sessionOpts)
+	if err != nil {
+		log.Fatalf("client: failed to initialize session: %v", err)
+	}
+
+	if err := session.Run(); err != nil && !errors.Is(err, os.ErrClosed) {
+		log.Printf("client: session ended with error: %v", err)
 	}
 }

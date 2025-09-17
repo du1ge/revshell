@@ -5,7 +5,7 @@ Simulate a fully interactive SSH-style shell terminal environment using Go to ex
 ## Features
 
 - Long-lived TCP connections between server and client.
-- Interactive remote shell that supports running arbitrary commands, `cd`, and exiting with `exit`.
+- Fully interactive remote shell backed by a pseudo-terminal on the client so history, tab-completion, and job control work as expected.
 - Pluggable stream encryption with selectable cipher suites (`aes`, `xor`) and the ability to register custom algorithms.
 - Configurable prompt template, initial working directory, and shell executable.
 
@@ -18,28 +18,28 @@ go build ./cmd/client
 
 ## Usage
 
-Start the server (listen on port 2222 by default):
+Start the server on the machine that will control remote clients (listen on port 2222 by default):
 
 ```bash
 ./server -pass mysecret -listen 0.0.0.0:2222 -cipher aes
 ```
 
-Connect with the client:
+Run the client on the machine you want to control:
 
 ```bash
 ./client -addr 127.0.0.1:2222 -pass mysecret -cipher aes
 ```
 
-Once connected you are greeted with a prompt similar to `user@host /current/path$`. Type commands exactly as you would in an SSH session. Use `exit` to terminate the session.
+Once connected the server terminal becomes an interactive shell attached to the client. Type commands exactly as you would in an SSH session (arrow keys, tab-completion, and Ctrl+C work). Use `exit` to terminate the session.
 
 ### Prompt customization
 
-The server accepts a `-prompt` flag allowing placeholders that are expanded on every command:
+The server accepts a `-prompt` flag allowing placeholders that are expanded on the client shell:
 
-- `{{.USER}}` – current user name as seen by the server.
-- `{{.HOST}}` – host name of the server machine.
-- `{{.CWD}}` – absolute path of the current working directory.
-- `{{.BASENAME}}` – basename of the current working directory.
+- `{{.USER}}` – current user name on the client machine.
+- `{{.HOST}}` – host name of the client machine.
+- `{{.CWD}}` – absolute path of the current working directory (maps to `\w`).
+- `{{.BASENAME}}` – basename of the current working directory (maps to `\W`).
 
 For example:
 
@@ -59,5 +59,6 @@ Additional ciphers can be registered at runtime using `secureio.RegisterCipherSu
 ### Notes
 
 - Both server and client must be launched with the same passphrase and cipher suite.
-- The `-shell` flag allows switching to shells such as `/bin/bash` if available.
-- Keep the terminal window open while the client is connected to maintain the long-lived session.
+- The `-shell` flag allows switching to shells such as `/bin/bash` if available (the executable is resolved on the client).
+- Keep the terminal window open on the server while a client is connected so you remain attached to the remote shell.
+- The server handles one interactive session at a time; wait for a session to close before accepting the next connection.
