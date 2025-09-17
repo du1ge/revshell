@@ -5,9 +5,10 @@ Simulate a fully interactive SSH-style shell terminal environment using Go to ex
 ## Features
 
 - Long-lived TCP connections between server and client.
-- Interactive remote shell that supports running arbitrary commands, `cd`, and exiting with `exit`.
+- **Reverse** interactive shell: the server listens for inbound clients and, once connected, receives a full PTY-backed shell from the client machine.
+- Fully interactive remote shell with history keys, readline support, and terminal control sequences.
 - Pluggable stream encryption with selectable cipher suites (`aes`, `xor`) and the ability to register custom algorithms.
-- Configurable prompt template, initial working directory, and shell executable.
+- Configurable prompt template, initial working directory, and shell executable provided by the client.
 
 ## Building
 
@@ -24,27 +25,29 @@ Start the server (listen on port 2222 by default):
 ./server -pass mysecret -listen 0.0.0.0:2222 -cipher aes
 ```
 
-Connect with the client:
+Launch the client on the machine you wish to control:
 
 ```bash
 ./client -addr 127.0.0.1:2222 -pass mysecret -cipher aes
 ```
 
-Once connected you are greeted with a prompt similar to `user@host /current/path$`. Type commands exactly as you would in an SSH session. Use `exit` to terminate the session.
+Once the handshake completes, the server terminal is switched to raw mode and bridged directly to the client's shell. History keys (↑/↓), interactive programs, and terminal escape sequences now behave exactly like an SSH session. Use `exit` inside the remote shell to terminate the connection.
+
+> **Note:** Because the remote shell runs on the client, only one interactive session can be active per server process.
 
 ### Prompt customization
 
-The server accepts a `-prompt` flag allowing placeholders that are expanded on every command:
+The client accepts a `-prompt` flag allowing placeholders that are expanded before exporting `PS1` to the remote shell:
 
-- `{{.USER}}` – current user name as seen by the server.
-- `{{.HOST}}` – host name of the server machine.
-- `{{.CWD}}` – absolute path of the current working directory.
-- `{{.BASENAME}}` – basename of the current working directory.
+- `{{.USER}}` – expands to the shell escape `\u`.
+- `{{.HOST}}` – expands to `\h`.
+- `{{.CWD}}` – expands to `\w`.
+- `{{.BASENAME}}` – expands to `\W`.
 
-For example:
+For example, to emulate the default bash prompt:
 
 ```bash
-./server -pass mysecret -prompt "[{{.BASENAME}}]$ "
+./client -pass mysecret -prompt "{{.USER}}@{{.HOST}} {{.BASENAME}}$ "
 ```
 
 ### Cipher suites
@@ -59,5 +62,5 @@ Additional ciphers can be registered at runtime using `secureio.RegisterCipherSu
 ### Notes
 
 - Both server and client must be launched with the same passphrase and cipher suite.
-- The `-shell` flag allows switching to shells such as `/bin/bash` if available.
-- Keep the terminal window open while the client is connected to maintain the long-lived session.
+- The client can choose a different shell binary via `-shell` (defaults to `/bin/sh`) and initial working directory via `-workdir`.
+- Keep the terminal window open on the server while the client is connected to maintain the long-lived session.
