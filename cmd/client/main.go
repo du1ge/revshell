@@ -31,7 +31,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	reader, writer, err := secureio.Handshake(conn, false, opts.aesKey, opts.authPassword)
+	transport, err := secureio.Handshake(conn, false, opts.aesKey, opts.authPassword)
 	if err != nil {
 		log.Fatalf("client: handshake failed: %v", err)
 	}
@@ -39,9 +39,13 @@ func main() {
 	log.Printf("client: connected to %s with AES-GCM encryption", opts.addr)
 
 	sessionOpts := terminal.Options{Prompt: opts.prompt, Shell: opts.shell, InitialDir: opts.workdir}
-	session, err := terminal.NewSession(reader, writer, sessionOpts)
+	session, err := terminal.NewSession(transport.Reader(), transport.Writer(), sessionOpts)
 	if err != nil {
 		log.Fatalf("client: failed to create session: %v", err)
+	}
+
+	if resizeEvents := transport.ResizeEvents(); resizeEvents != nil {
+		session.SetResizeEvents(resizeEvents)
 	}
 
 	if err := session.Run(); err != nil && !errors.Is(err, io.EOF) {

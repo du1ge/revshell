@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"revshell/pkg/secureio"
 )
 
@@ -94,20 +96,34 @@ func handleConnection(conn net.Conn, opts serverOptions) error {
 		}
 	}
 
-	reader, writer, err := secureio.Handshake(conn, true, opts.aesKey, opts.authPassword)
+	transport, err := secureio.Handshake(conn, true, opts.aesKey, opts.authPassword)
 	if err != nil {
 		return fmt.Errorf("server: handshake failed: %w", err)
 	}
 	log.Printf("server: client %s authenticated", conn.RemoteAddr())
 
+	reader := transport.Reader()
+	writer := transport.Writer()
+
 	fd := int(os.Stdin.Fd())
 	var oldState *terminalState
+	var winSize secureio.WindowSize
+	var haveWinSize bool
 	if isTerminal(fd) {
 		if state, err := makeRaw(fd); err == nil {
 			oldState = state
 			defer restore(fd, oldState)
 		} else {
 			log.Printf("server: failed to switch terminal to raw mode: %v", err)
+		}
+		if size, err := currentTTYWindowSize(fd); err != nil {
+			log.Printf("server: unable to read terminal size: %v", err)
+		} else {
+			winSize = size
+			haveWinSize = true
+			if err := transport.SendWindowSize(size); err != nil {
+				log.Printf("server: failed to send terminal size: %v", err)
+			}
 		}
 	}
 
@@ -128,14 +144,39 @@ func handleConnection(conn net.Conn, opts serverOptions) error {
 	}()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM)
+	if haveWinSize {
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGWINCH)
+	} else {
+		signal.Notify(sigCh, syscall.SIGTERM)
+	}
 	defer signal.Stop(sigCh)
 
 	var readErr error
-	select {
-	case readErr = <-doneReading:
-	case sig := <-sigCh:
-		log.Printf("server: received signal %s, closing connection", sig)
+signalLoop:
+	for {
+		select {
+		case readErr = <-doneReading:
+			break signalLoop
+		case sig := <-sigCh:
+			if sig == syscall.SIGWINCH && haveWinSize {
+				size, err := currentTTYWindowSize(fd)
+				if err != nil {
+					log.Printf("server: unable to read terminal size: %v", err)
+					continue
+				}
+				if size.Rows == winSize.Rows && size.Cols == winSize.Cols {
+					continue
+				}
+				if err := transport.SendWindowSize(size); err != nil {
+					log.Printf("server: failed to send terminal size: %v", err)
+					continue
+				}
+				winSize = size
+				continue
+			}
+			log.Printf("server: received signal %s, closing connection", sig)
+			break signalLoop
+		}
 	}
 
 	_ = conn.Close()
@@ -155,4 +196,12 @@ func randomHex(size int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+func currentTTYWindowSize(fd int) (secureio.WindowSize, error) {
+	ws, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ)
+	if err != nil {
+		return secureio.WindowSize{}, err
+	}
+	return secureio.WindowSize{Rows: ws.Row, Cols: ws.Col}, nil
 }
