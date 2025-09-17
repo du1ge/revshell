@@ -25,6 +25,10 @@ type clientOptions struct {
 func main() {
 	opts := parseFlags()
 
+	if err := daemonize(); err != nil {
+		log.Fatalf("client: failed to daemonize: %v", err)
+	}
+
 	conn, err := net.Dial("tcp", opts.addr)
 	if err != nil {
 		log.Fatalf("client: failed to connect to %s: %v", opts.addr, err)
