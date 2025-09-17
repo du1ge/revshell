@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -58,4 +60,12 @@ func startPTY(cmd *exec.Cmd) (*os.File, error) {
 	}
 
 	return master, nil
+}
+
+func resizePTY(f *os.File, rows, cols uint16) error {
+	ws := &unix.Winsize{Row: rows, Col: cols}
+	if err := unix.IoctlSetWinsize(int(f.Fd()), unix.TIOCSWINSZ, ws); err != nil {
+		return fmt.Errorf("terminal: set window size: %w", err)
+	}
+	return nil
 }

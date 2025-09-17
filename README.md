@@ -7,6 +7,7 @@ Simulate a fully interactive SSH-style shell terminal environment using Go to ex
 - Long-lived TCP connections between server and client.
 - **Reverse** interactive shell: the server listens for inbound clients and, once connected, receives a full PTY-backed shell from the client machine.
 - Fully interactive remote shell with history keys, readline support, and terminal control sequences.
+- Propagates terminal resize events so the remote PTY tracks the controller's window dimensions.
 - AES-GCM encrypted transport with explicit password authentication before a session is established.
 - Configurable prompt template, initial working directory, and shell executable provided by the client.
 
@@ -32,6 +33,8 @@ Launch the client on the machine you wish to control:
 ```
 
 Once the handshake completes, the server terminal is switched to raw mode and bridged directly to the client's shell. History keys (↑/↓), interactive programs, and terminal escape sequences now behave exactly like an SSH session. Use `exit` inside the remote shell to terminate the connection.
+
+The server forwards its local terminal dimensions to the client at connect time and whenever the window is resized (via `SIGWINCH`). The client's PTY applies these updates immediately, keeping full-screen TUIs and pagers aligned with the controller's window.
 
 > **Note:** Because the remote shell runs on the client, only one interactive session can be active per server process.
 

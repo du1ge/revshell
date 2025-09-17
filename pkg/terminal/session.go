@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"revshell/pkg/secureio"
 )
 
 // Options defines configuration values for an interactive shell session.
@@ -20,10 +22,11 @@ type Options struct {
 // Session models an interactive command execution environment backed by a
 // local PTY-powered shell process.
 type Session struct {
-	reader io.Reader
-	writer io.Writer
-	opts   Options
-	closed bool
+	reader   io.Reader
+	writer   io.Writer
+	opts     Options
+	closed   bool
+	resizeCh <-chan secureio.WindowSize
 }
 
 // NewSession constructs a new interactive session over the provided reader and
@@ -47,6 +50,13 @@ func NewSession(r io.Reader, w io.Writer, opts Options) (*Session, error) {
 		writer: w,
 		opts:   opts,
 	}, nil
+}
+
+// SetResizeEvents registers a channel delivering terminal resize notifications
+// from the remote peer. Notifications are forwarded to the PTY when the
+// session starts running.
+func (s *Session) SetResizeEvents(ch <-chan secureio.WindowSize) {
+	s.resizeCh = ch
 }
 
 // Run starts the interactive loop, wiring the remote stream to a PTY-backed
@@ -75,6 +85,19 @@ func (s *Session) Run() error {
 	defer func() { _ = ptmx.Close() }()
 
 	errCh := make(chan error, 2)
+
+	if s.resizeCh != nil {
+		go func(ch <-chan secureio.WindowSize, f *os.File) {
+			for size := range ch {
+				if size.Rows == 0 || size.Cols == 0 {
+					continue
+				}
+				if err := resizePTY(f, size.Rows, size.Cols); err != nil {
+					fmt.Fprintf(os.Stderr, "terminal: failed to resize pty: %v\n", err)
+				}
+			}
+		}(s.resizeCh, ptmx)
+	}
 
 	go func() {
 		_, err := io.Copy(s.writer, ptmx)
