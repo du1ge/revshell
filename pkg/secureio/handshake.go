@@ -1,245 +1,249 @@
 package secureio
 
 import (
-	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"sort"
+	"sync"
 )
 
-// Handshake establishes a secure reader and writer on top of the provided
-// connection using the requested cipher suite. The same passphrase must be
-// supplied on both sides of the connection.
-func Handshake(conn net.Conn, isServer bool, passphrase, cipherName string) (io.Reader, io.Writer, error) {
-	suite, err := getCipherSuite(cipherName)
+const (
+	frameTypeData       = 0x01
+	frameTypeAuth       = 0x02
+	frameTypeAuthOK     = 0x03
+	frameTypeAuthReject = 0x04
+
+	maxFramePayload = 32 * 1024
+)
+
+// Handshake establishes an encrypted AES-GCM transport on top of conn and
+// performs password authentication. The same AES key and authentication
+// password must be provided on both sides of the connection.
+func Handshake(conn net.Conn, isServer bool, aesKey, authPassword string) (io.Reader, io.Writer, error) {
+	if aesKey == "" {
+		return nil, nil, errors.New("secureio: AES key must be provided")
+	}
+	if authPassword == "" {
+		return nil, nil, errors.New("secureio: authentication password must be provided")
+	}
+
+	serverNonce := make([]byte, 32)
+	clientNonce := make([]byte, 32)
+
+	if isServer {
+		if _, err := rand.Read(serverNonce); err != nil {
+			return nil, nil, fmt.Errorf("secureio: generate server nonce: %w", err)
+		}
+		if _, err := conn.Write(serverNonce); err != nil {
+			return nil, nil, fmt.Errorf("secureio: send server nonce: %w", err)
+		}
+		if _, err := io.ReadFull(conn, clientNonce); err != nil {
+			return nil, nil, fmt.Errorf("secureio: read client nonce: %w", err)
+		}
+	} else {
+		if _, err := io.ReadFull(conn, serverNonce); err != nil {
+			return nil, nil, fmt.Errorf("secureio: read server nonce: %w", err)
+		}
+		if _, err := rand.Read(clientNonce); err != nil {
+			return nil, nil, fmt.Errorf("secureio: generate client nonce: %w", err)
+		}
+		if _, err := conn.Write(clientNonce); err != nil {
+			return nil, nil, fmt.Errorf("secureio: send client nonce: %w", err)
+		}
+	}
+
+	sessionKey := deriveSessionKey(aesKey, serverNonce, clientNonce)
+	transport, err := newGCMTransport(conn, sessionKey)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return suite.handshake(conn, isServer, passphrase)
-}
+	expectedAuth := deriveAuthDigest(authPassword, serverNonce, clientNonce)
 
-type cipherSuite interface {
-	handshake(conn net.Conn, isServer bool, passphrase string) (io.Reader, io.Writer, error)
-	Name() string
-}
-
-var registeredSuites = map[string]cipherSuite{
-	"aes": &aesSuite{},
-	"xor": &xorSuite{},
-}
-
-func getCipherSuite(name string) (cipherSuite, error) {
-	suite, ok := registeredSuites[name]
-	if !ok {
-		return nil, fmt.Errorf("secureio: unknown cipher suite %q", name)
+	if isServer {
+		frameType, payload, err := transport.readFrame()
+		if err != nil {
+			return nil, nil, fmt.Errorf("secureio: read auth frame: %w", err)
+		}
+		if frameType != frameTypeAuth {
+			return nil, nil, fmt.Errorf("secureio: unexpected frame type %d during authentication", frameType)
+		}
+		if subtle.ConstantTimeCompare(payload, expectedAuth[:]) != 1 {
+			_ = transport.writeFrame(frameTypeAuthReject, nil)
+			return nil, nil, errors.New("secureio: authentication failed")
+		}
+		if err := transport.writeFrame(frameTypeAuthOK, nil); err != nil {
+			return nil, nil, fmt.Errorf("secureio: send auth acknowledgement: %w", err)
+		}
+	} else {
+		if err := transport.writeFrame(frameTypeAuth, expectedAuth[:]); err != nil {
+			return nil, nil, fmt.Errorf("secureio: send auth frame: %w", err)
+		}
+		frameType, _, err := transport.readFrame()
+		if err != nil {
+			return nil, nil, fmt.Errorf("secureio: read auth response: %w", err)
+		}
+		if frameType != frameTypeAuthOK {
+			return nil, nil, errors.New("secureio: authentication rejected by server")
+		}
 	}
-	return suite, nil
+
+	reader := &gcmReader{transport: transport}
+	writer := &gcmWriter{transport: transport}
+	return reader, writer, nil
 }
 
-func deriveKey(passphrase string) []byte {
-	sum := sha256.Sum256([]byte(passphrase))
-	return sum[:]
-}
-
-func deriveBytes(direction string, serverNonce, clientNonce []byte, size int) []byte {
+func deriveSessionKey(aesKey string, serverNonce, clientNonce []byte) []byte {
 	h := sha256.New()
-	h.Write([]byte(direction))
+	h.Write([]byte("revshell/aes-gcm"))
+	h.Write([]byte(aesKey))
 	h.Write(serverNonce)
 	h.Write(clientNonce)
-	sum := h.Sum(nil)
-	if size <= len(sum) {
-		return sum[:size]
-	}
-
-	buf := make([]byte, size)
-	copy(buf, sum)
-	pos := len(sum)
-	for pos < size {
-		h.Reset()
-		h.Write(sum)
-		sum = h.Sum(nil)
-		n := copy(buf[pos:], sum)
-		pos += n
-	}
-	return buf
+	return h.Sum(nil)
 }
 
-const (
-	directionServerToClient = "srv->cli"
-	directionClientToServer = "cli->srv"
-)
+func deriveAuthDigest(password string, serverNonce, clientNonce []byte) [32]byte {
+	h := sha256.New()
+	h.Write([]byte("revshell/auth"))
+	h.Write([]byte(password))
+	h.Write(serverNonce)
+	h.Write(clientNonce)
+	var digest [32]byte
+	copy(digest[:], h.Sum(nil))
+	return digest
+}
 
-type aesSuite struct{}
+type gcmTransport struct {
+	conn    net.Conn
+	gcm     cipher.AEAD
+	readBuf []byte
+	writeMu sync.Mutex
+}
 
-func (s *aesSuite) Name() string { return "aes" }
-
-func (s *aesSuite) handshake(conn net.Conn, isServer bool, passphrase string) (io.Reader, io.Writer, error) {
-	key := deriveKey(passphrase)
-
-	serverNonce := make([]byte, aes.BlockSize)
-	clientNonce := make([]byte, aes.BlockSize)
-
-	if isServer {
-		if _, err := rand.Read(serverNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to generate server nonce: %w", err)
-		}
-		if _, err := conn.Write(serverNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to send server nonce: %w", err)
-		}
-		if _, err := io.ReadFull(conn, clientNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to read client nonce: %w", err)
-		}
-	} else {
-		if _, err := io.ReadFull(conn, serverNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to read server nonce: %w", err)
-		}
-		if _, err := rand.Read(clientNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to generate client nonce: %w", err)
-		}
-		if _, err := conn.Write(clientNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to send client nonce: %w", err)
-		}
-	}
-
+func newGCMTransport(conn net.Conn, key []byte) (*gcmTransport, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, nil, fmt.Errorf("secureio: failed to create AES cipher: %w", err)
+		return nil, fmt.Errorf("secureio: create AES cipher: %w", err)
 	}
-
-	serverToClientIV := deriveBytes(directionServerToClient, serverNonce, clientNonce, aes.BlockSize)
-	clientToServerIV := deriveBytes(directionClientToServer, serverNonce, clientNonce, aes.BlockSize)
-
-	var readStream, writeStream cipher.Stream
-	if isServer {
-		readStream = cipher.NewCTR(block, clientToServerIV)
-		writeStream = cipher.NewCTR(block, serverToClientIV)
-	} else {
-		readStream = cipher.NewCTR(block, serverToClientIV)
-		writeStream = cipher.NewCTR(block, clientToServerIV)
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("secureio: create AES-GCM: %w", err)
 	}
-
-	reader := &cipher.StreamReader{S: readStream, R: conn}
-	writer := &cipher.StreamWriter{S: writeStream, W: conn}
-
-	return bufio.NewReader(reader), writer, nil
+	return &gcmTransport{conn: conn, gcm: gcm}, nil
 }
 
-type xorSuite struct{}
-
-func (s *xorSuite) Name() string { return "xor" }
-
-func (s *xorSuite) handshake(conn net.Conn, isServer bool, passphrase string) (io.Reader, io.Writer, error) {
-	key := deriveKey(passphrase)
-	serverNonce := make([]byte, 16)
-	clientNonce := make([]byte, 16)
-
-	if isServer {
-		if _, err := rand.Read(serverNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to generate server nonce: %w", err)
-		}
-		if _, err := conn.Write(serverNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to send server nonce: %w", err)
-		}
-		if _, err := io.ReadFull(conn, clientNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to read client nonce: %w", err)
-		}
-	} else {
-		if _, err := io.ReadFull(conn, serverNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to read server nonce: %w", err)
-		}
-		if _, err := rand.Read(clientNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to generate client nonce: %w", err)
-		}
-		if _, err := conn.Write(clientNonce); err != nil {
-			return nil, nil, fmt.Errorf("secureio: failed to send client nonce: %w", err)
-		}
+func (t *gcmTransport) readFrame() (byte, []byte, error) {
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(t.conn, header); err != nil {
+		return 0, nil, err
 	}
-
-	serverToClientKey := mixKey(deriveBytes(directionServerToClient, serverNonce, clientNonce, len(key)), key)
-	clientToServerKey := mixKey(deriveBytes(directionClientToServer, serverNonce, clientNonce, len(key)), key)
-
-	var readKey, writeKey []byte
-	if isServer {
-		readKey = clientToServerKey
-		writeKey = serverToClientKey
-	} else {
-		readKey = serverToClientKey
-		writeKey = clientToServerKey
+	frameType := header[0]
+	cipherLen := binary.BigEndian.Uint32(header[1:])
+	nonceSize := t.gcm.NonceSize()
+	if cipherLen > maxFramePayload+uint32(t.gcm.Overhead()) {
+		return 0, nil, fmt.Errorf("secureio: encrypted frame too large: %d bytes", cipherLen)
 	}
-
-	reader := &cipher.StreamReader{S: newXORStream(readKey), R: conn}
-	writer := &cipher.StreamWriter{S: newXORStream(writeKey), W: conn}
-	return bufio.NewReader(reader), writer, nil
+	nonce := make([]byte, nonceSize)
+	if _, err := io.ReadFull(t.conn, nonce); err != nil {
+		return 0, nil, err
+	}
+	ciphertext := make([]byte, cipherLen)
+	if _, err := io.ReadFull(t.conn, ciphertext); err != nil {
+		return 0, nil, err
+	}
+	payload, err := t.gcm.Open(nil, nonce, ciphertext, []byte{frameType})
+	if err != nil {
+		return 0, nil, fmt.Errorf("secureio: decrypt frame: %w", err)
+	}
+	return frameType, payload, nil
 }
 
-type xorStream struct {
-	key []byte
-	pos int
-}
+func (t *gcmTransport) writeFrame(frameType byte, payload []byte) error {
+	if len(payload) > maxFramePayload {
+		return fmt.Errorf("secureio: frame payload too large: %d bytes", len(payload))
+	}
 
-func newXORStream(key []byte) cipher.Stream {
-	if len(key) == 0 {
-		panic("secureio: xor stream requires non-empty key")
+	nonce := make([]byte, t.gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return fmt.Errorf("secureio: generate nonce: %w", err)
 	}
-	copied := make([]byte, len(key))
-	copy(copied, key)
-	return &xorStream{key: copied}
-}
 
-func (x *xorStream) XORKeyStream(dst, src []byte) {
-	if len(x.key) == 0 {
-		panic("secureio: xor stream has empty key")
-	}
-	for i := range src {
-		dst[i] = src[i] ^ x.key[x.pos%len(x.key)]
-		x.pos++
-	}
-}
+	ciphertext := t.gcm.Seal(nil, nonce, payload, []byte{frameType})
 
-func mixKey(input, key []byte) []byte {
-	if len(key) == 0 {
-		panic("secureio: cannot mix with empty key")
-	}
-	if len(input) == 0 {
-		return nil
-	}
-	result := make([]byte, len(input))
-	copy(result, input)
-	for i := range result {
-		result[i] ^= key[i%len(key)]
-	}
-	return result
-}
+	header := make([]byte, 5)
+	header[0] = frameType
+	binary.BigEndian.PutUint32(header[1:], uint32(len(ciphertext)))
 
-// ListCipherSuites returns the names of all registered cipher suites.
-func ListCipherSuites() []string {
-	names := make([]string, 0, len(registeredSuites))
-	for name := range registeredSuites {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 
-// RegisterCipherSuite allows external packages to register their own cipher suite
-// implementations. It returns an error if the name is already in use.
-func RegisterCipherSuite(name string, suite cipherSuite) error {
-	if name == "" {
-		return errors.New("secureio: cipher suite name cannot be empty")
+	if _, err := t.conn.Write(header); err != nil {
+		return err
 	}
-	if suite == nil {
-		return errors.New("secureio: cipher suite cannot be nil")
+	if _, err := t.conn.Write(nonce); err != nil {
+		return err
 	}
-	if _, exists := registeredSuites[name]; exists {
-		return fmt.Errorf("secureio: cipher suite %q already registered", name)
+	if _, err := t.conn.Write(ciphertext); err != nil {
+		return err
 	}
-	registeredSuites[name] = suite
 	return nil
+}
+
+func (t *gcmTransport) Read(p []byte) (int, error) {
+	for len(t.readBuf) == 0 {
+		frameType, payload, err := t.readFrame()
+		if err != nil {
+			return 0, err
+		}
+		if frameType != frameTypeData {
+			return 0, fmt.Errorf("secureio: unexpected frame type %d while reading", frameType)
+		}
+		if len(payload) == 0 {
+			continue
+		}
+		t.readBuf = payload
+	}
+
+	n := copy(p, t.readBuf)
+	t.readBuf = t.readBuf[n:]
+	return n, nil
+}
+
+func (t *gcmTransport) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		chunk := p
+		if len(chunk) > maxFramePayload {
+			chunk = p[:maxFramePayload]
+		}
+		if err := t.writeFrame(frameTypeData, chunk); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		p = p[len(chunk):]
+	}
+	return written, nil
+}
+
+type gcmReader struct {
+	transport *gcmTransport
+}
+
+func (r *gcmReader) Read(p []byte) (int, error) {
+	return r.transport.Read(p)
+}
+
+type gcmWriter struct {
+	transport *gcmTransport
+}
+
+func (w *gcmWriter) Write(p []byte) (int, error) {
+	return w.transport.Write(p)
 }

