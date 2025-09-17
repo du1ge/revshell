@@ -1,25 +1,25 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"revshell/pkg/secureio"
-	"revshell/pkg/terminal"
 )
 
 type serverOptions struct {
 	listenAddr string
 	passphrase string
 	cipher     string
-	shell      string
-	prompt     string
-	workdir    string
 }
 
 func main() {
@@ -45,7 +45,12 @@ func main() {
 			return
 		}
 
-		go handleConnection(conn, opts)
+		log.Printf("server: accepted connection from %s", conn.RemoteAddr())
+		if err := handleConnection(conn, opts); err != nil {
+			log.Printf("server: session for %s ended with error: %v", conn.RemoteAddr(), err)
+		} else {
+			log.Printf("server: session for %s closed", conn.RemoteAddr())
+		}
 	}
 }
 
@@ -54,9 +59,6 @@ func parseFlags() serverOptions {
 	listen := flag.String("listen", "0.0.0.0:2222", "address to listen on")
 	pass := flag.String("pass", "", "shared passphrase used to derive encryption keys")
 	cipherName := flag.String("cipher", "aes", fmt.Sprintf("cipher suite to use (%s)", available))
-	shell := flag.String("shell", "/bin/sh", "shell executable used to run commands")
-	prompt := flag.String("prompt", "", "prompt template (supports {{.USER}}, {{.HOST}}, {{.CWD}}, {{.BASENAME}})")
-	workdir := flag.String("workdir", "", "initial working directory for new sessions")
 	flag.Parse()
 
 	if *pass == "" {
@@ -68,13 +70,10 @@ func parseFlags() serverOptions {
 		listenAddr: *listen,
 		passphrase: *pass,
 		cipher:     *cipherName,
-		shell:      *shell,
-		prompt:     *prompt,
-		workdir:    *workdir,
 	}
 }
 
-func handleConnection(conn net.Conn, opts serverOptions) {
+func handleConnection(conn net.Conn, opts serverOptions) error {
 	defer conn.Close()
 
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
@@ -83,24 +82,56 @@ func handleConnection(conn net.Conn, opts serverOptions) {
 		}
 	}
 
-	log.Printf("server: accepted connection from %s", conn.RemoteAddr())
-
 	reader, writer, err := secureio.Handshake(conn, true, opts.passphrase, opts.cipher)
 	if err != nil {
-		log.Printf("server: handshake failed for %s: %v", conn.RemoteAddr(), err)
-		return
+		return fmt.Errorf("server: handshake failed: %w", err)
 	}
 
-	sessionOpts := terminal.Options{Prompt: opts.prompt, Shell: opts.shell, InitialDir: opts.workdir}
-	session, err := terminal.NewSession(reader, writer, sessionOpts)
-	if err != nil {
-		log.Printf("server: failed to create session for %s: %v", conn.RemoteAddr(), err)
-		return
+	fd := int(os.Stdin.Fd())
+	var oldState *terminalState
+	if isTerminal(fd) {
+		if state, err := makeRaw(fd); err == nil {
+			oldState = state
+			defer restore(fd, oldState)
+		} else {
+			log.Printf("server: failed to switch terminal to raw mode: %v", err)
+		}
 	}
 
-	if err := session.Run(); err != nil {
-		log.Printf("server: session for %s ended with error: %v", conn.RemoteAddr(), err)
-	} else {
-		log.Printf("server: session for %s closed", conn.RemoteAddr())
+	doneReading := make(chan error, 1)
+	doneWriting := make(chan error, 1)
+
+	go func() {
+		_, err := io.Copy(os.Stdout, reader)
+		doneReading <- err
+	}()
+
+	go func() {
+		_, err := io.Copy(writer, os.Stdin)
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.CloseWrite()
+		}
+		doneWriting <- err
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	var readErr error
+	select {
+	case readErr = <-doneReading:
+	case sig := <-sigCh:
+		log.Printf("server: received signal %s, closing connection", sig)
 	}
+
+	_ = conn.Close()
+
+	if writeErr := <-doneWriting; writeErr != nil && !errors.Is(writeErr, io.EOF) {
+		log.Printf("server: write error: %v", writeErr)
+	}
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return readErr
+	}
+	return nil
 }

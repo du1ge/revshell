@@ -1,7 +1,6 @@
 package terminal
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -18,14 +17,12 @@ type Options struct {
 	InitialDir string
 }
 
-// Session models an interactive command execution environment similar to an
-// SSH shell.
+// Session models an interactive command execution environment backed by a
+// local PTY-powered shell process.
 type Session struct {
-	rw     *bufio.ReadWriter
+	reader io.Reader
+	writer io.Writer
 	opts   Options
-	cwd    string
-	user   string
-	host   string
 	closed bool
 }
 
@@ -37,177 +34,92 @@ func NewSession(r io.Reader, w io.Writer, opts Options) (*Session, error) {
 		opts.Shell = "/bin/sh"
 	}
 
-	user := os.Getenv("USER")
-	if user == "" {
-		user = "user"
-	}
-
-	host, err := os.Hostname()
-	if err != nil {
-		host = "localhost"
-	}
-
-	cwd := opts.InitialDir
-	if cwd == "" {
-		if home := os.Getenv("HOME"); home != "" {
-			cwd = home
-		} else if pwd, err := os.Getwd(); err == nil {
-			cwd = pwd
-		} else {
-			cwd = "/"
+	if opts.InitialDir != "" {
+		abs, err := filepath.Abs(opts.InitialDir)
+		if err != nil {
+			return nil, fmt.Errorf("terminal: resolve initial directory: %w", err)
 		}
+		opts.InitialDir = abs
 	}
 
 	return &Session{
-		rw:   bufio.NewReadWriter(bufio.NewReader(r), bufio.NewWriter(w)),
-		opts: opts,
-		cwd:  cwd,
-		user: user,
-		host: host,
+		reader: r,
+		writer: w,
+		opts:   opts,
 	}, nil
 }
 
-// Run starts the interactive loop, reading commands from the client and
-// returning when the client disconnects or explicitly exits the session.
+// Run starts the interactive loop, wiring the remote stream to a PTY-backed
+// shell process on the local machine.
 func (s *Session) Run() error {
 	if s.closed {
 		return errors.New("terminal: session already closed")
 	}
-	if err := s.writeLine("Welcome to the Go remote shell. Type 'exit' to disconnect."); err != nil {
-		return err
-	}
 
-	for {
-		if err := s.writePrompt(); err != nil {
-			return err
-		}
-
-		line, err := s.rw.ReadString('\n')
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-
-		command := strings.TrimRight(line, "\r\n")
-		if command == "" {
-			continue
-		}
-
-		if command == "exit" {
-			if err := s.writeLine("Bye!"); err != nil {
-				return err
-			}
-			s.closed = true
-			return nil
-		}
-
-		if strings.HasPrefix(command, "cd") {
-			if err := s.handleCD(command); err != nil {
-				if err := s.writeLine(err.Error()); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-
-		output, execErr := s.executeCommand(command)
-		if output != "" {
-			if err := s.writeString(output); err != nil {
-				return err
-			}
-		}
-		if execErr != nil {
-			if err := s.writeLine(execErr.Error()); err != nil {
-				return err
-			}
-		}
-	}
-}
-
-func (s *Session) executeCommand(command string) (string, error) {
-	cmd := exec.Command(s.opts.Shell, "-c", command)
+	cmd := exec.Command(s.opts.Shell)
 	cmd.Env = os.Environ()
-	cmd.Dir = s.cwd
-	output, err := cmd.CombinedOutput()
-	return string(output), err
-}
-
-func (s *Session) handleCD(command string) error {
-	trimmed := strings.TrimSpace(command)
-	if trimmed == "cd" {
-		if home := os.Getenv("HOME"); home != "" {
-			s.cwd = home
-			return nil
-		}
-		return errors.New("terminal: HOME not set")
+	if s.opts.InitialDir != "" {
+		cmd.Dir = s.opts.InitialDir
 	}
 
-	parts := strings.Fields(trimmed)
-	if len(parts) < 2 {
-		return errors.New("terminal: cd requires a target directory")
+	if prompt := s.promptPS1(); prompt != "" {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("PS1=%s", prompt))
 	}
 
-	target := parts[1]
-	if strings.HasPrefix(target, "~") {
-		if home := os.Getenv("HOME"); home != "" {
-			switch {
-			case target == "~":
-				target = home
-			case strings.HasPrefix(target, "~/"):
-				target = filepath.Join(home, target[2:])
-			}
-		}
-	}
-	if !filepath.IsAbs(target) {
-		target = filepath.Join(s.cwd, target)
-	}
+	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
 
-	resolved, err := filepath.Abs(target)
+	ptmx, err := startPTY(cmd)
 	if err != nil {
-		return fmt.Errorf("terminal: resolve directory: %w", err)
+		return fmt.Errorf("terminal: start shell: %w", err)
+	}
+	defer func() { _ = ptmx.Close() }()
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		_, err := io.Copy(s.writer, ptmx)
+		errCh <- err
+	}()
+
+	go func() {
+		_, err := io.Copy(ptmx, s.reader)
+		errCh <- err
+	}()
+
+	var firstErr error
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) && firstErr == nil {
+			firstErr = err
+		}
 	}
 
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return fmt.Errorf("terminal: cd: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("terminal: %s is not a directory", resolved)
+	_ = ptmx.Close()
+
+	if err := cmd.Wait(); err != nil {
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
 
-	s.cwd = resolved
+	s.closed = true
+
+	if firstErr != nil && !errors.Is(firstErr, io.EOF) && !errors.Is(firstErr, os.ErrClosed) {
+		return firstErr
+	}
+
 	return nil
 }
 
-func (s *Session) writePrompt() error {
+func (s *Session) promptPS1() string {
+	if s.opts.Prompt == "" {
+		return ""
+	}
+
 	prompt := s.opts.Prompt
-	if prompt == "" {
-		prompt = "{{.USER}}@{{.HOST}} {{.CWD}}$ "
-	}
-
-	prompt = strings.ReplaceAll(prompt, "{{.USER}}", s.user)
-	prompt = strings.ReplaceAll(prompt, "{{.HOST}}", s.host)
-	prompt = strings.ReplaceAll(prompt, "{{.CWD}}", s.cwd)
-	prompt = strings.ReplaceAll(prompt, "{{.BASENAME}}", filepath.Base(s.cwd))
-
-	if _, err := s.rw.WriteString(prompt); err != nil {
-		return err
-	}
-	return s.rw.Flush()
-}
-
-func (s *Session) writeLine(text string) error {
-	if _, err := s.rw.WriteString(text + "\n"); err != nil {
-		return err
-	}
-	return s.rw.Flush()
-}
-
-func (s *Session) writeString(text string) error {
-	if _, err := s.rw.WriteString(text); err != nil {
-		return err
-	}
-	return s.rw.Flush()
+	prompt = strings.ReplaceAll(prompt, "{{.USER}}", "\\u")
+	prompt = strings.ReplaceAll(prompt, "{{.HOST}}", "\\h")
+	prompt = strings.ReplaceAll(prompt, "{{.CWD}}", "\\w")
+	prompt = strings.ReplaceAll(prompt, "{{.BASENAME}}", "\\W")
+	prompt = strings.ReplaceAll(prompt, "\n", "\\n")
+	return prompt
 }
