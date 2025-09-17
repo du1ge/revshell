@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"revshell/pkg/secureio"
 )
@@ -82,9 +83,15 @@ func (s *Session) Run() error {
 	if err != nil {
 		return fmt.Errorf("terminal: start shell: %w", err)
 	}
-	defer func() { _ = ptmx.Close() }()
 
-	errCh := make(chan error, 2)
+	var closeOnce sync.Once
+	closePTY := func() {
+		closeOnce.Do(func() { _ = ptmx.Close() })
+	}
+	defer closePTY()
+
+	writerDone := make(chan error, 1)
+	readerDone := make(chan error, 1)
 
 	if s.resizeCh != nil {
 		go func(ch <-chan secureio.WindowSize, f *os.File) {
@@ -100,23 +107,46 @@ func (s *Session) Run() error {
 	}
 
 	go func() {
+		defer closePTY()
 		_, err := io.Copy(s.writer, ptmx)
-		errCh <- err
+		writerDone <- err
 	}()
 
 	go func() {
+		defer closePTY()
 		_, err := io.Copy(ptmx, s.reader)
-		errCh <- err
+		readerDone <- err
 	}()
 
 	var firstErr error
-	for i := 0; i < 2; i++ {
-		if err := <-errCh; err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) && firstErr == nil {
+	var other <-chan error
+	disconnected := false
+
+	select {
+	case err := <-readerDone:
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) && firstErr == nil {
+			firstErr = err
+		}
+		disconnected = true
+		closePTY()
+		other = writerDone
+	case err := <-writerDone:
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) && firstErr == nil {
+			firstErr = err
+		}
+		closePTY()
+		other = readerDone
+	}
+
+	if disconnected && cmd.ProcessState == nil {
+		_ = cmd.Process.Kill()
+	}
+
+	if other != nil {
+		if err := <-other; err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) && firstErr == nil {
 			firstErr = err
 		}
 	}
-
-	_ = ptmx.Close()
 
 	if err := cmd.Wait(); err != nil {
 		if firstErr == nil {
