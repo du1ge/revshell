@@ -21,10 +21,30 @@ type clientOptions struct {
 	prompt       string
 	workdir      string
 	foreground   bool
+	daemonized   bool
 }
 
 func main() {
 	opts := parseFlags()
+
+	if !opts.foreground {
+		if opts.daemonized {
+			if err := finalizeDaemonEnvironment(); err != nil {
+				log.Fatalf("client: failed to finalize background environment: %v", err)
+			}
+		} else if !daemonSupported {
+			log.Printf("client: background mode is only supported on Linux; continuing in foreground")
+		} else {
+			log.Printf("client: launching background mode")
+			shouldExit, err := daemonize(&opts)
+			if err != nil {
+				log.Fatalf("client: failed to daemonize: %v", err)
+			}
+			if shouldExit {
+				return
+			}
+		}
+	}
 
 	conn, err := net.Dial("tcp", opts.addr)
 	if err != nil {
@@ -35,21 +55,6 @@ func main() {
 	reader, writer, err := secureio.Handshake(conn, false, opts.aesKey, opts.authPassword)
 	if err != nil {
 		log.Fatalf("client: handshake failed: %v", err)
-	}
-
-	if !opts.foreground {
-		if !daemonSupported {
-			log.Printf("client: background mode is only supported on Linux; continuing in foreground")
-		} else {
-			log.Printf("client: handshake successful, entering background mode")
-			shouldExit, err := daemonize()
-			if err != nil {
-				log.Fatalf("client: failed to daemonize: %v", err)
-			}
-			if shouldExit {
-				return
-			}
-		}
 	}
 
 	log.Printf("client: connected to %s with AES-GCM encryption", opts.addr)
@@ -72,7 +77,8 @@ func parseFlags() clientOptions {
 	shell := flag.String("shell", "/bin/sh", "shell executable used to run commands")
 	prompt := flag.String("prompt", "", "prompt template forwarded to the remote shell (supports {{.USER}}, {{.HOST}}, {{.CWD}}, {{.BASENAME}})")
 	workdir := flag.String("workdir", "", "initial working directory for new sessions")
-	foreground := flag.Bool("foreground", false, "run in the foreground without daemonizing after the handshake")
+	foreground := flag.Bool("foreground", false, "run in the foreground without spawning a background copy")
+	daemonized := flag.Bool("daemonized", false, "(internal) mark the client as already running in background mode")
 
 	flag.Parse()
 
@@ -97,5 +103,6 @@ func parseFlags() clientOptions {
 		prompt:       *prompt,
 		workdir:      *workdir,
 		foreground:   *foreground,
+		daemonized:   *daemonized,
 	}
 }

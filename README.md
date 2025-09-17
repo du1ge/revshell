@@ -31,10 +31,9 @@ Launch the client on the machine you wish to control:
 ./client --server 127.0.0.1:9999 --aes-key <hex-encoded-key> --auth-password <shared-password>
 ```
 
-After a successful handshake the client detaches into the background on Linux systems, closes its standard file descriptors, and
-continues streaming shell traffic to the server. Log messages are forwarded to the host syslog facility. Use the `--foreground`
-flag to keep the process attached to the current terminal or when running on non-Linux platforms where daemonization is
-unavailable.
+On Linux the client automatically spawns a detached background copy that connects to the server, closes its standard file
+descriptors, and streams shell traffic while logging to the host syslog facility. Use the `--foreground` flag to keep the process
+attached to the current terminal or when running on non-Linux platforms where daemonization is unavailable.
 
 Once the handshake completes, the server terminal is switched to raw mode and bridged directly to the client's shell. History keys (↑/↓), interactive programs, and terminal escape sequences now behave exactly like an SSH session. Use `exit` inside the remote shell to terminate the connection.
 
