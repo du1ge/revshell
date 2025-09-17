@@ -20,6 +20,7 @@ type clientOptions struct {
 	shell        string
 	prompt       string
 	workdir      string
+	foreground   bool
 }
 
 func main() {
@@ -34,6 +35,17 @@ func main() {
 	reader, writer, err := secureio.Handshake(conn, false, opts.aesKey, opts.authPassword)
 	if err != nil {
 		log.Fatalf("client: handshake failed: %v", err)
+	}
+
+	if !opts.foreground {
+		if !daemonSupported {
+			log.Printf("client: background mode is only supported on Linux; continuing in foreground")
+		} else {
+			log.Printf("client: handshake successful, entering background mode")
+			if err := daemonize(); err != nil {
+				log.Fatalf("client: failed to daemonize: %v", err)
+			}
+		}
 	}
 
 	log.Printf("client: connected to %s with AES-GCM encryption", opts.addr)
@@ -56,6 +68,8 @@ func parseFlags() clientOptions {
 	shell := flag.String("shell", "/bin/sh", "shell executable used to run commands")
 	prompt := flag.String("prompt", "", "prompt template forwarded to the remote shell (supports {{.USER}}, {{.HOST}}, {{.CWD}}, {{.BASENAME}})")
 	workdir := flag.String("workdir", "", "initial working directory for new sessions")
+	foreground := flag.Bool("foreground", false, "run in the foreground without daemonizing after the handshake")
+
 	flag.Parse()
 
 	missing := false
@@ -78,5 +92,6 @@ func parseFlags() clientOptions {
 		shell:        *shell,
 		prompt:       *prompt,
 		workdir:      *workdir,
+		foreground:   *foreground,
 	}
 }
