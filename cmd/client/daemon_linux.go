@@ -7,51 +7,63 @@ import (
 	"log"
 	"log/syslog"
 	"os"
+	"runtime"
 	"syscall"
 )
 
 const daemonSupported = true
 
-func daemonize() error {
+func daemonize() (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	syscall.ForkLock.Lock()
 	pid, err := fork()
 	if err != nil {
-		return err
+		syscall.ForkLock.Unlock()
+		return false, err
 	}
 	if pid > 0 {
-		os.Exit(0)
+		syscall.ForkLock.Unlock()
+		return true, nil
 	}
+	syscall.ForkLock.Unlock()
 
 	if _, err := syscall.Setsid(); err != nil {
-		return err
+		return false, err
 	}
 
+	syscall.ForkLock.Lock()
 	pid, err = fork()
 	if err != nil {
-		return err
+		syscall.ForkLock.Unlock()
+		return false, err
 	}
 	if pid > 0 {
-		os.Exit(0)
+		syscall.ForkLock.Unlock()
+		return true, nil
 	}
+	syscall.ForkLock.Unlock()
 
 	if err := os.Chdir("/"); err != nil {
-		return err
+		return false, err
 	}
 	syscall.Umask(0)
 
 	nullFile, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer nullFile.Close()
 
 	if err := syscall.Dup2(int(nullFile.Fd()), int(os.Stdin.Fd())); err != nil {
-		return err
+		return false, err
 	}
 	if err := syscall.Dup2(int(nullFile.Fd()), int(os.Stdout.Fd())); err != nil {
-		return err
+		return false, err
 	}
 	if err := syscall.Dup2(int(nullFile.Fd()), int(os.Stderr.Fd())); err != nil {
-		return err
+		return false, err
 	}
 
 	writer, err := syslog.New(syslog.LOG_DAEMON|syslog.LOG_INFO, "revshell-client")
@@ -62,7 +74,7 @@ func daemonize() error {
 	}
 	log.SetFlags(log.LstdFlags)
 
-	return nil
+	return false, nil
 }
 
 func fork() (int, error) {

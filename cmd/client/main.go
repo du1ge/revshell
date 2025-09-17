@@ -42,8 +42,12 @@ func main() {
 			log.Printf("client: background mode is only supported on Linux; continuing in foreground")
 		} else {
 			log.Printf("client: handshake successful, entering background mode")
-			if err := daemonize(); err != nil {
+			shouldExit, err := daemonize()
+			if err != nil {
 				log.Fatalf("client: failed to daemonize: %v", err)
+			}
+			if shouldExit {
+				return
 			}
 		}
 	}
