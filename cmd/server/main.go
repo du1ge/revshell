@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,7 +11,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -17,13 +18,30 @@ import (
 )
 
 type serverOptions struct {
-	listenAddr string
-	passphrase string
-	cipher     string
+	listenAddr   string
+	aesKey       string
+	authPassword string
 }
 
 func main() {
 	opts := parseFlags()
+
+	if opts.aesKey == "" {
+		key, err := randomHex(32)
+		if err != nil {
+			log.Fatalf("server: failed to generate AES key: %v", err)
+		}
+		opts.aesKey = key
+		log.Printf("server: generated random AES key: %s", key)
+	}
+	if opts.authPassword == "" {
+		pass, err := randomHex(16)
+		if err != nil {
+			log.Fatalf("server: failed to generate authentication password: %v", err)
+		}
+		opts.authPassword = pass
+		log.Printf("server: generated random authentication password: %s", pass)
+	}
 
 	listener, err := net.Listen("tcp", opts.listenAddr)
 	if err != nil {
@@ -31,7 +49,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("server: listening on %s using %s cipher", opts.listenAddr, opts.cipher)
+	log.Printf("server: listening on %s using AES-GCM encryption", opts.listenAddr)
 
 	for {
 		conn, err := listener.Accept()
@@ -55,21 +73,15 @@ func main() {
 }
 
 func parseFlags() serverOptions {
-	available := strings.Join(secureio.ListCipherSuites(), ", ")
-	listen := flag.String("listen", "0.0.0.0:2222", "address to listen on")
-	pass := flag.String("pass", "", "shared passphrase used to derive encryption keys")
-	cipherName := flag.String("cipher", "aes", fmt.Sprintf("cipher suite to use (%s)", available))
+	listen := flag.String("listen", "0.0.0.0:9999", "address to listen on")
+	aesKey := flag.String("aes-key", "", "AES key or passphrase shared with clients")
+	authPass := flag.String("auth-password", "", "authentication password shared with clients")
 	flag.Parse()
 
-	if *pass == "" {
-		fmt.Fprintln(os.Stderr, "server: passphrase must be provided via -pass")
-		os.Exit(1)
-	}
-
 	return serverOptions{
-		listenAddr: *listen,
-		passphrase: *pass,
-		cipher:     *cipherName,
+		listenAddr:   *listen,
+		aesKey:       *aesKey,
+		authPassword: *authPass,
 	}
 }
 
@@ -82,10 +94,11 @@ func handleConnection(conn net.Conn, opts serverOptions) error {
 		}
 	}
 
-	reader, writer, err := secureio.Handshake(conn, true, opts.passphrase, opts.cipher)
+	reader, writer, err := secureio.Handshake(conn, true, opts.aesKey, opts.authPassword)
 	if err != nil {
 		return fmt.Errorf("server: handshake failed: %w", err)
 	}
+	log.Printf("server: client %s authenticated", conn.RemoteAddr())
 
 	fd := int(os.Stdin.Fd())
 	var oldState *terminalState
@@ -134,4 +147,12 @@ func handleConnection(conn net.Conn, opts serverOptions) error {
 		return readErr
 	}
 	return nil
+}
+
+func randomHex(size int) (string, error) {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }

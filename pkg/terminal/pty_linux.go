@@ -49,7 +49,7 @@ func startPTY(cmd *exec.Cmd) (*os.File, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setctty: true,
 		Setsid:  true,
-		Ctty:    int(slave.Fd()),
+		Ctty:    0,
 	}
 
 	if err := cmd.Start(); err != nil {
