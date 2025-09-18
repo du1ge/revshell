@@ -130,8 +130,16 @@ func handleConnection(conn net.Conn, opts serverOptions) error {
 	doneReading := make(chan error, 1)
 	doneWriting := make(chan error, 1)
 
+	stdout := newScrollbackWriter(os.Stdout)
 	go func() {
-		_, err := io.Copy(os.Stdout, reader)
+		_, err := io.Copy(stdout, reader)
+		if flushErr := stdout.Flush(); flushErr != nil {
+			if err == nil {
+				err = flushErr
+			} else {
+				log.Printf("server: failed to flush terminal output: %v", flushErr)
+			}
+		}
 		doneReading <- err
 	}()
 
